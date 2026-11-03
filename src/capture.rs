@@ -20,6 +20,8 @@ pub struct Capture {
     pub img: Img,
     /// Output name (e.g. "HDMI-A-1"), only for `Target::Active`.
     pub screen: Option<String>,
+    /// Preview-sized copy, when computed ahead of time.
+    pub preview: Option<Img>,
 }
 
 const NAME: &str = "org.kde.KWin";
@@ -120,5 +122,5 @@ pub fn grab(conn: &gio::DBusConnection, target: &Target) -> Result<Capture, Stri
     data.truncate(stride * h);
     data.shrink_to_fit(); // mremap for large allocations: no copy
     crate::util::trace("capture: done");
-    Ok(Capture { img: Img::new(glib::Bytes::from_owned(data), w, h, stride, scale), screen })
+    Ok(Capture { img: Img::from_vec(data, w, h, stride, scale), screen, preview: None })
 }

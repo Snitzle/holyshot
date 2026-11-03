@@ -91,6 +91,9 @@ pub struct Editor {
     tv: gtk::TextView,
     base: Img,
     base_tex: gdk::Texture,
+    /// The base image pre-scaled to the current view, in device pixels, so
+    /// the CPU renderer blits it 1:1 instead of resampling 5 MP every frame.
+    view_tex: RefCell<Option<((usize, usize), gdk::Texture)>>,
     unit: f32,
     st: RefCell<St>,
     ui: RefCell<Option<Ui>>,
@@ -163,6 +166,7 @@ impl Editor {
             tv,
             base: img,
             base_tex,
+            view_tex: RefCell::new(None),
             unit,
             st: RefCell::new(St {
                 shapes: vec![],
@@ -193,6 +197,7 @@ impl Editor {
         ed.sync_toolbar();
         ed.update_title();
         ed.initial_size();
+        util::trace_first_paint(&ed.win, "editor: first paint");
         ed.win.present();
         ed.canvas.grab_focus();
         ed
@@ -550,14 +555,42 @@ impl Editor {
     }
 
     // ---- view geometry ----------------------------------------------------------
+    fn dpr(&self) -> f32 {
+        self.canvas.native().and_then(|n| n.surface()).map(|s| s.scale() as f32).unwrap_or(1.0)
+    }
+
+    /// View scale (logical px per image px) and offset, snapped so the image
+    /// covers a whole number of device pixels starting on a device pixel.
     fn fit(&self) -> (f32, P) {
         let (w, h) = (self.canvas.width() as f32, self.canvas.height() as f32);
         let (bw, bh) = (self.base.w as f32, self.base.h as f32);
         let margin = 28.0;
-        let dpr = self.canvas.native().and_then(|n| n.surface()).map(|s| s.scale() as f32).unwrap_or(1.0);
+        let dpr = self.dpr();
         // never upscale past 1 image px = 1 screen px
         let s = ((w - 2.0 * margin).max(1.0) / bw).min((h - 2.0 * margin).max(1.0) / bh).min(1.0 / dpr);
-        (s, P::new(((w - bw * s) / 2.0).round(), ((h - bh * s) / 2.0).round()))
+        let s = (bw * s * dpr).floor().max(1.0) / (bw * dpr);
+        let snap = |v: f32| (v * dpr).round() / dpr;
+        (s, P::new(snap((w - bw * s) / 2.0), snap((h - bh * s) / 2.0)))
+    }
+
+    fn view_texture(&self, s: f32) -> gdk::Texture {
+        let dpr = self.dpr();
+        let size = (
+            ((self.base.w as f32 * s * dpr).round() as usize).max(1),
+            ((self.base.h as f32 * s * dpr).round() as usize).max(1),
+        );
+        if size.0 >= self.base.w {
+            return self.base_tex.clone();
+        }
+        let mut cache = self.view_tex.borrow_mut();
+        match cache.as_ref() {
+            Some((k, t)) if *k == size => t.clone(),
+            _ => {
+                let t = self.base.downscale(size.0, size.1).texture();
+                *cache = Some((size, t.clone()));
+                t
+            }
+        }
     }
 
     fn to_img(&self, x: f32, y: f32) -> P {
@@ -586,12 +619,14 @@ impl Editor {
         let ir = rect(o.x, o.y, self.base.w as f32 * s, self.base.h as f32 * s);
         sn.append_outset_shadow(&util::rounded(ir, 0.0), &rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 0.0, 16.0);
         let pctx = self.canvas.pango_context();
-        let ctx = Ctx { base: &self.base, base_tex: &self.base_tex, pango: &pctx };
+        let view = self.view_texture(s);
+        let ctx = Ctx { base: &self.base, base_tex: &view, pango: &pctx };
+        sn.append_texture(&view, &ir);
         sn.push_clip(&ir);
         sn.save();
         sn.translate(&graphene::Point::new(o.x, o.y));
         sn.scale(s, s);
-        shapes::render(sn, &ctx, &st.shapes, st.active.as_ref(), gsk::ScalingFilter::Trilinear);
+        shapes::render(sn, &ctx, &st.shapes, st.active.as_ref(), false);
         sn.restore();
         sn.pop();
 
@@ -1062,7 +1097,7 @@ impl Editor {
         let sn = gtk::Snapshot::new();
         {
             let st = self.st.borrow();
-            shapes::render(&sn, &ctx, &st.shapes, None, gsk::ScalingFilter::Linear);
+            shapes::render(&sn, &ctx, &st.shapes, None, true);
         }
         let node = sn.to_node()?;
         let renderer = self.canvas.native()?.renderer()?;
@@ -1078,9 +1113,7 @@ impl Editor {
         let me = self.clone();
         glib::spawn_future_local(async move {
             let ok = gio::spawn_blocking(move || {
-                let mut png = Vec::with_capacity(4 << 20);
-                img.write_png_with(&mut png, png::Compression::Fast, png::Filter::Adaptive).is_ok()
-                    && util::clipboard_png_bytes(png)
+                img.encode_png(crate::img::deflate::LEVEL).is_ok_and(util::clipboard_png_bytes)
             })
             .await
             .unwrap_or(false);
@@ -1141,7 +1174,7 @@ impl Editor {
             // never race the original background save of this file
             hs.wait_saved(&path).await;
             let p = path.clone();
-            let r = gio::spawn_blocking(move || save_any(&img, &p)).await.unwrap_or_else(|_| Err("save failed".into()));
+            let r = gio::spawn_blocking(move || save_any(img, &p)).await.unwrap_or_else(|_| Err("save failed".into()));
             match r {
                 Ok(()) => {
                     {
@@ -1257,6 +1290,9 @@ impl Editor {
                 None => println!("export failed"),
             }
             ed.st.borrow_mut().dirty = false;
+            if util::bench_close_ms().is_some() {
+                ed.close();
+            }
         });
     }
 }
@@ -1268,12 +1304,12 @@ fn with_ext(mut p: PathBuf) -> PathBuf {
     p
 }
 
-fn save_any(img: &Img, path: &std::path::Path) -> Result<(), String> {
+fn save_any(img: Img, path: &std::path::Path) -> Result<(), String> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     if ext == "jpg" || ext == "jpeg" {
         let mut rgb = Vec::with_capacity(img.w * img.h * 3);
         for y in 0..img.h {
-            let row = &img.bytes[y * img.stride..y * img.stride + img.w * 4];
+            let row = img.row(y);
             for p in row.chunks_exact(4) {
                 rgb.extend_from_slice(&[p[2], p[1], p[0]]);
             }

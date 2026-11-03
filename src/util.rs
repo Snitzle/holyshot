@@ -13,7 +13,73 @@ pub fn trace_init() {
 pub fn trace(what: &str) {
     if let Some((t, true)) = START.get() {
         use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "[{:7.1} ms] {what}", t.elapsed().as_secs_f64() * 1000.0);
+        let (total, delta) = icount::sample();
+        let _ = writeln!(
+            std::io::stderr(),
+            "[{:7.1} ms] [{:>14}] {what}",
+            t.elapsed().as_secs_f64() * 1000.0,
+            format!("{:.1}M +{:.1}M", total as f64 / 1e6, delta as f64 / 1e6)
+        );
+    }
+}
+
+/// Instructions retired by this thread so far (0 if unavailable).
+pub fn instructions() -> u64 {
+    icount::read_now()
+}
+
+/// Per-thread retired-instruction counter (perf_event_open), for tracing only.
+mod icount {
+    use std::cell::Cell;
+    use std::ffi::{c_int, c_long};
+    unsafe extern "C" {
+        fn syscall(num: c_long, ...) -> c_long;
+        fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    }
+    thread_local! {
+        static FD: Cell<c_int> = const { Cell::new(-2) };
+        static LAST: Cell<u64> = const { Cell::new(0) };
+    }
+    fn open() -> c_int {
+        let mut attr = [0u8; 128];
+        attr[4..8].copy_from_slice(&128u32.to_ne_bytes()); // size
+        attr[8..16].copy_from_slice(&1u64.to_ne_bytes()); // PERF_COUNT_HW_INSTRUCTIONS (type 0 = HARDWARE)
+        attr[40..48].copy_from_slice(&((1u64 << 5) | (1u64 << 6)).to_ne_bytes()); // exclude kernel/hv
+        // SAFETY: perf_event_open(attr, pid=0 (this thread), cpu=-1, group=-1, flags=0)
+        unsafe { syscall(298, attr.as_ptr(), 0 as c_int, -1 as c_int, -1 as c_int, 0 as c_long) as c_int }
+    }
+    pub fn read_now() -> u64 {
+        let fd = FD.with(|f| {
+            if f.get() == -2 {
+                f.set(open());
+            }
+            f.get()
+        });
+        if fd < 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 8];
+        // SAFETY: reading 8 bytes from our own perf fd into a local buffer
+        unsafe { read(fd, buf.as_mut_ptr(), 8) };
+        u64::from_ne_bytes(buf)
+    }
+
+    pub fn sample() -> (u64, u64) {
+        let fd = FD.with(|f| {
+            if f.get() == -2 {
+                f.set(open());
+            }
+            f.get()
+        });
+        if fd < 0 {
+            return (0, 0);
+        }
+        let mut buf = [0u8; 8];
+        // SAFETY: reading 8 bytes from our own perf fd into a local buffer
+        unsafe { read(fd, buf.as_mut_ptr(), 8) };
+        let n = u64::from_ne_bytes(buf);
+        let d = n - LAST.with(|l| l.replace(n));
+        (n, d)
     }
 }
 
@@ -26,6 +92,26 @@ pub fn trace_once(what: &'static str) {
             trace(what);
         }
     }
+}
+
+/// Count events when tracing; totals are printed at exit (`trace_counts`).
+pub fn count(what: &'static str) {
+    static_counts(|m| *m.entry(what).or_insert(0) += 1);
+}
+
+fn static_counts(f: impl FnOnce(&mut std::collections::BTreeMap<&'static str, u64>)) {
+    static C: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    if let Some((_, true)) = START.get() {
+        f(&mut C.lock().unwrap());
+    }
+}
+
+pub fn trace_counts() {
+    static_counts(|m| {
+        for (k, v) in m.iter() {
+            trace(&format!("count {k} = {v}"));
+        }
+    });
 }
 
 /// Trace when a window's first frame has been painted.
@@ -317,20 +403,6 @@ fn expand(p: &str) -> PathBuf {
         None if p == "~" => glib::home_dir(),
         None => PathBuf::from(p),
     }
-}
-
-// Benchmarked on 3440x1440 screenshots (`holyshot __bench-png`):
-//   Balanced + NoFilter  120-175 ms  720-750 KB   <- files (runs in background)
-//   Fast + Adaptive       19-77 ms   960-1080 KB  <- clipboard (latency matters)
-//   High + anything      300-450 ms  ~same size as Balanced
-// Screenshots are mostly flat colour, where unfiltered rows + real zlib
-// matching beat the PNG filters.
-pub fn png_compression() -> png::Compression {
-    png::Compression::Balanced
-}
-
-pub fn png_filter() -> png::Filter {
-    png::Filter::NoFilter
 }
 
 pub fn unique_path() -> PathBuf {

@@ -7,7 +7,6 @@ description = "Mac-style screenshot + annotation tool for KDE Plasma (Wayland)"
 [dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 gtk4-layer-shell = "0.8"
-png = "0.18"
 
 [profile.release]
 opt-level = 3

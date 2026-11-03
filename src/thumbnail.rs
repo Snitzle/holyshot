@@ -36,19 +36,40 @@ pub struct Thumb {
     hs: Weak<Hs>,
     win: gtk::Window,
     area: DrawArea,
-    img: Img,
-    tex: gdk::Texture,
+    /// The preview never holds the full image: the save thread owns it (and
+    /// encodes it in place), then the file serves the editor and drag-and-
+    /// drop. Saves ~20 MB for the preview's lifetime, the longest phase.
+    size: (usize, usize),
+    scale: f64,
     path: PathBuf,
+    /// The preview at exactly its on-screen pixel size (see `show`).
+    small: gdk::Texture,
+    /// Shadow + image + border, rendered once (lazily, at device scale) so
+    /// each animation frame is a single blit instead of a CPU blur.
+    card: RefCell<Option<gdk::Texture>>,
     tw: f32,
     th: f32,
     st: RefCell<State>,
 }
 
 impl Thumb {
-    pub fn show(hs: &Rc<Hs>, img: Img, path: PathBuf, monitor: Option<gdk::Monitor>) -> Rc<Thumb> {
+    /// Device-pixel size of the preview for an image shown at `dpr`.
+    pub fn preview_size(img: &Img, dpr: f64) -> (usize, usize) {
+        let dpr = dpr.max(1.0) as f32;
         let (lw, lh) = (img.w as f32 / img.scale as f32, img.h as f32 / img.scale as f32);
         let k = (MAX_W / lw).min(MAX_H / lh).min(1.0);
-        let (tw, th) = ((lw * k).round().max(48.0), (lh * k).round().max(32.0));
+        (((lw * k).max(48.0) * dpr).round() as usize, ((lh * k).max(32.0) * dpr).round() as usize)
+    }
+
+    /// `preview` must be `preview_size` for the monitor (the capture thread
+    /// computes it in parallel with GTK start-up for whole-screen shots).
+    pub fn show(hs: &Rc<Hs>, preview: Img, size: (usize, usize), path: PathBuf, monitor: Option<gdk::Monitor>) -> Rc<Thumb> {
+        // Pre-scaled to the exact device-pixel size: the CPU renderer would
+        // otherwise resample the full capture every frame (~60 ms CPU each).
+        let dpr = monitor.as_ref().map(|m| m.scale()).unwrap_or(preview.scale).max(1.0) as f32;
+        let scale = preview.scale;
+        let small = preview.texture();
+        let (tw, th) = (small.width() as f32 / dpr, small.height() as f32 / dpr);
 
         let win = gtk::Window::new();
         win.set_application(Some(&hs.app));
@@ -61,11 +82,11 @@ impl Thumb {
         win.set_anchor(Edge::Bottom, true);
         win.set_anchor(Edge::Right, true);
         win.set_margin(Edge::Bottom, MARGIN);
-        win.set_margin(Edge::Right, MARGIN);
+        win.set_margin(Edge::Right, MARGIN); // updated per frame by `animate`
         win.set_keyboard_mode(KeyboardMode::None);
         win.set_decorated(false);
         win.add_css_class("hs-layer");
-        let (ww, wh) = ((tw + 2.0 * PAD) as i32, (th + 2.0 * PAD) as i32);
+        let (ww, wh) = ((tw + 2.0 * PAD).ceil() as i32, (th + 2.0 * PAD).ceil() as i32);
         win.set_default_size(ww, wh);
 
         let area = DrawArea::new();
@@ -74,14 +95,15 @@ impl Thumb {
         win.set_child(Some(&area));
 
         util::trace("thumbnail: window built");
-        let tex = img.texture();
         let t = Rc::new(Thumb {
             hs: Rc::downgrade(hs),
             win,
             area,
-            img,
-            tex,
+            size,
+            scale,
             path,
+            small,
+            card: RefCell::new(None),
             tw,
             th,
             st: RefCell::new(State {
@@ -97,6 +119,7 @@ impl Thumb {
             }),
         });
         t.connect();
+        t.win.set_margin(Edge::Right, MARGIN - ww);
         util::trace_first_paint(&t.win, "thumbnail: first paint");
         t.win.present();
         util::trace("thumbnail presented");
@@ -179,10 +202,15 @@ impl Thumb {
             let t = w.upgrade()?;
             let file = gio::File::for_path(&t.path);
             let files = gdk::FileList::from_array(&[file]);
-            Some(gdk::ContentProvider::new_union(&[
-                gdk::ContentProvider::for_value(&files.to_value()),
-                gdk::ContentProvider::for_value(&t.tex.to_value()),
-            ]))
+            let files = gdk::ContentProvider::for_value(&files.to_value());
+            // also offer the image itself, for apps that take pasted images
+            Some(match std::fs::read(&t.path) {
+                Ok(png) => gdk::ContentProvider::new_union(&[
+                    files,
+                    gdk::ContentProvider::for_bytes("image/png", &glib::Bytes::from_owned(png)),
+                ]),
+                Err(_) => files, // still being written (first ~30 ms)
+            })
         });
         let w = Rc::downgrade(self);
         drag.connect_drag_begin(move |src, _| {
@@ -193,7 +221,7 @@ impl Thumb {
                     st.dragging = true;
                     st.press = None;
                 }
-                let pic = gtk::Picture::for_paintable(&t.tex);
+                let pic = gtk::Picture::for_paintable(&t.small);
                 pic.set_size_request((t.tw * 0.6) as i32, (t.th * 0.6) as i32);
                 pic.set_can_shrink(true);
                 let icon = gtk::DragIcon::for_drag(&src.drag().unwrap());
@@ -295,15 +323,20 @@ impl Thumb {
     }
 
     pub fn img_size(&self) -> (usize, usize) {
-        (self.img.w, self.img.h)
+        self.size
     }
 
     pub fn open_editor(self: &Rc<Self>) {
         let Some(hs) = self.hs.upgrade() else { return };
-        let (img, path) = (self.img.clone(), self.path.clone());
-        // Open the editor before closing so the app never runs out of windows.
-        hs.open_editor(img, Some(path));
+        let (path, scale) = (self.path.clone(), self.scale);
+        // Keep the app alive across the hand-over (the preview closes first).
+        let hold = hs.app.hold();
         self.close_now();
+        glib::spawn_future_local(async move {
+            hs.wait_saved(&path).await;
+            hs.edit_file_at_scale(&path, scale);
+            drop(hold);
+        });
     }
 
     // ---- timers & animation ---------------------------------------------------
@@ -384,8 +417,11 @@ impl Thumb {
             let k = ((clock.frame_time() - start) as f32 / dur).clamp(0.0, 1.0);
             let out = to < from; // sliding in
             let e = if out { 1.0 - (1.0 - k).powi(3) } else { k * k * k };
-            t.st.borrow_mut().offset = from + (to - from) * e;
-            t.area.queue_draw();
+            let off = from + (to - from) * e;
+            t.st.borrow_mut().offset = off;
+            // Slide by moving the surface (layer-shell margin), not by
+            // redrawing it: the compositor repositions, our pixels don't change.
+            t.win.set_margin(Edge::Right, MARGIN - off.round() as i32);
             util::trace_once("thumbnail: first anim tick");
             if k < 1.0 {
                 return glib::ControlFlow::Continue;
@@ -400,7 +436,11 @@ impl Thumb {
 
     // ---- drawing -----------------------------------------------------------------
     fn thumb_rect(&self) -> graphene::Rect {
-        rect(PAD + self.st.borrow().offset, PAD, self.tw, self.th)
+        // keep it on whole device pixels so the blit stays 1:1
+        let dpr = self.area.native().and_then(|n| n.surface()).map(|s| s.scale() as f32).unwrap_or(1.0);
+        let x = (PAD * dpr).round() / dpr;
+        let y = (PAD * dpr).round() / dpr;
+        rect(x, y, self.tw, self.th)
     }
 
     fn close_rect(&self) -> graphene::Rect {
@@ -408,20 +448,47 @@ impl Thumb {
         rect(r.x() - 9.0, r.y() - 9.0, 22.0, 22.0)
     }
 
-    fn draw(&self, sn: &gtk::Snapshot) {
-        let r = self.thumb_rect();
+    fn dpr(&self) -> f32 {
+        self.area.native().and_then(|n| n.surface()).map(|s| s.scale() as f32).unwrap_or(1.0)
+    }
+
+    fn card(&self) -> Option<gdk::Texture> {
+        if let Some(t) = self.card.borrow().as_ref() {
+            return Some(t.clone());
+        }
+        let dpr = self.dpr();
+        let (w, h) = (self.area.width() as f32, self.area.height() as f32);
+        let r = rect(PAD, PAD, self.tw, self.th);
         let rr = util::rounded(r, RADIUS);
+        let sn = gtk::Snapshot::new();
+        sn.scale(dpr, dpr);
         sn.append_outset_shadow(&rr, &rgba(0.0, 0.0, 0.0, 0.45), 0.0, 4.0, 0.0, 14.0);
         sn.push_rounded_clip(&rr);
-        // Trilinear = mipmapped downscale: crisp even from a 3440px source.
-        sn.append_scaled_texture(&self.tex, gsk::ScalingFilter::Trilinear, &r);
-        let st = self.st.borrow();
-        if st.hover {
-            sn.append_color(&rgba(1.0, 1.0, 1.0, 0.1), &r);
-        }
+        sn.append_texture(&self.small, &r);
         sn.pop();
         sn.append_border(&util::rounded(r.inset_r(1.0, 1.0), RADIUS - 1.0), &[2.0; 4], &[rgba(1.0, 1.0, 1.0, 0.85); 4]);
         sn.append_border(&rr, &[1.0; 4], &[rgba(0.0, 0.0, 0.0, 0.25); 4]);
+        let node = sn.to_node()?;
+        let renderer = gsk::CairoRenderer::new();
+        renderer.realize_for_display(&WidgetExt::display(&self.area)).ok()?;
+        let tex = renderer.render_texture(node, Some(&rect(0.0, 0.0, (w * dpr).round(), (h * dpr).round())));
+        renderer.unrealize();
+        *self.card.borrow_mut() = Some(tex.clone());
+        Some(tex)
+    }
+
+    fn draw(&self, sn: &gtk::Snapshot) {
+        let r = self.thumb_rect();
+        if let Some(card) = self.card() {
+            let dpr = self.dpr();
+            sn.append_texture(&card, &rect(r.x() - PAD, 0.0, card.width() as f32 / dpr, card.height() as f32 / dpr));
+        }
+        let st = self.st.borrow();
+        if st.hover {
+            sn.push_rounded_clip(&util::rounded(r, RADIUS));
+            sn.append_color(&rgba(1.0, 1.0, 1.0, 0.1), &r);
+            sn.pop();
+        }
 
         if st.hover && !st.dismissing {
             let c = self.close_rect();

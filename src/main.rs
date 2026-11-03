@@ -63,6 +63,26 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
+    if cmd == "__bench-scale" {
+        gtk::init().ok();
+        let t = gdk::Texture::from_filename(&args[2]).unwrap();
+        let img = Img::from_texture(&t, 1.0);
+        for (w, h) in [(2750usize, 1151usize), (1720, 720), (345, 144)] {
+            let i0 = util::instructions();
+            let t0 = std::time::Instant::now();
+            let out = img.downscale(w, h);
+            println!(
+                "{}x{} -> {}x{}: {:.1} M instr, {:.1} ms",
+                img.w, img.h, out.w, out.h,
+                (util::instructions() - i0) as f64 / 1e6,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let i0 = util::instructions();
+        let _ = img.texture();
+        println!("texture(): {:.1} M", (util::instructions() - i0) as f64 / 1e6);
+        return glib::ExitCode::SUCCESS;
+    }
     if cmd == "__bench-png" {
         gtk::init().ok();
         for f in &args[2..] {
@@ -94,7 +114,14 @@ fn main() -> glib::ExitCode {
             if capture::other_instance_running(&conn) {
                 return None;
             }
-            Some(capture::grab(&conn, &target))
+            let mut r = capture::grab(&conn, &target);
+            if let (Ok(c), Target::Active) = (&mut r, &target) {
+                // the preview's downscale, while GTK is still starting
+                let (w, h) = thumbnail::Thumb::preview_size(&c.img, c.img.scale);
+                c.preview = Some(c.img.downscale(w, h));
+                util::trace("capture: preview ready");
+            }
+            Some(r)
         });
         EARLY.with(|e| *e.borrow_mut() = Some((cmd.to_string(), handle)));
     }
@@ -119,6 +146,7 @@ fn main() -> glib::ExitCode {
     });
     util::trace("app built, running");
     let code = app.run_with_args(&args);
+    util::trace_counts();
     util::trace("exit");
     code
 }
@@ -191,7 +219,7 @@ impl Hs {
             }
             "__selftest-menu" => {
                 self.capture("menu-test", Target::Active, |hs, c| {
-                    hs.captured(c.img, None);
+                    hs.captured(c.img, None, None);
                     let hs2 = hs.clone();
                     glib::timeout_add_local_once(Duration::from_millis(500), move || {
                         if let Some(t) = hs2.thumb.borrow().clone() {
@@ -273,7 +301,7 @@ impl Hs {
     pub fn picked(self: &Rc<Self>, result: Option<(Img, gdk::Monitor)>) {
         self.picker.borrow_mut().take();
         if let Some((img, mon)) = result {
-            self.captured(img, Some(mon));
+            self.captured(img, None, Some(mon));
         }
     }
 
@@ -284,20 +312,26 @@ impl Hs {
         }
         self.capture("screen", Target::Active, |hs, c| {
             let mon = util::monitors().into_iter().find(|m| m.connector().as_deref() == c.screen.as_deref());
-            hs.captured(c.img, mon);
+            hs.captured(c.img, c.preview, mon);
         });
     }
 
-    fn captured(self: &Rc<Self>, img: Img, mon: Option<gdk::Monitor>) {
+    fn captured(self: &Rc<Self>, img: Img, preview: Option<Img>, mon: Option<gdk::Monitor>) {
         let path = util::unique_path();
         self.saving.borrow_mut().insert(path.clone());
         let hold = self.app.hold();
         let me = self.clone();
-        let (img2, path2, thumb_path) = (img.clone(), path.clone(), path.clone());
+        // The preview gets a small copy; the full image goes to the save
+        // thread as its only owner, so it can be encoded in place.
+        let dpr = mon.as_ref().map(|m| m.scale()).unwrap_or(img.scale);
+        let want = thumbnail::Thumb::preview_size(&img, dpr);
+        let preview = preview.filter(|p| (p.w, p.h) == want).unwrap_or_else(|| img.downscale(want.0, want.1));
+        let size = (img.w, img.h);
+        let (path2, thumb_path) = (path.clone(), path.clone());
         glib::spawn_future_local(async move {
             let r = gio::spawn_blocking(move || {
                 util::trace("save: start");
-                img2.save_png(&path2)?;
+                img.save_png(&path2)?;
                 util::trace("save: done");
                 if util::config().copy_to_clipboard {
                     util::clipboard_png_file(&path2);
@@ -316,7 +350,7 @@ impl Hs {
         if let Some(t) = old {
             t.close_now();
         }
-        let t = thumbnail::Thumb::show(self, img, thumb_path, mon);
+        let t = thumbnail::Thumb::show(self, preview, size, thumb_path, mon);
         *self.thumb.borrow_mut() = Some(t);
     }
 
@@ -338,8 +372,13 @@ impl Hs {
     }
 
     fn edit_file(self: &Rc<Self>, path: &std::path::Path) {
+        self.edit_file_at_scale(path, 1.0);
+    }
+
+    /// `scale`: the screen scale the image was captured at (sets annotation sizes).
+    pub fn edit_file_at_scale(self: &Rc<Self>, path: &std::path::Path, scale: f64) {
         match gdk::Texture::from_filename(path) {
-            Ok(tex) => self.open_editor(Img::from_texture(&tex, 1.0), Some(path.to_path_buf())),
+            Ok(tex) => self.open_editor(Img::from_texture(&tex, scale), Some(path.to_path_buf())),
             Err(e) => util::notify("Couldn't open image", &format!("{}: {e}", path.display())),
         }
     }

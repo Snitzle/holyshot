@@ -38,6 +38,7 @@ mod imp {
                 f(&obj, sn, obj.width() as f32, obj.height() as f32);
             }
             crate::util::trace_once("first snapshot done");
+            crate::util::count("snapshots");
         }
     }
 }

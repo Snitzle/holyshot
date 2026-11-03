@@ -17,6 +17,7 @@ echo "==> Checking dependencies"
 missing=()
 /usr/bin/pkg-config --exists gtk4 2>/dev/null || missing+=(gtk4-devel)
 [ -e /usr/lib64/libgtk4-layer-shell.so.0 ] || missing+=(gtk4-layer-shell)
+[ -e /usr/lib64/libdeflate.so.0 ] || missing+=(libdeflate)
 command -v wl-copy >/dev/null || missing+=(wl-clipboard)
 if [ ${#missing[@]} -gt 0 ]; then
     echo "Missing packages: sudo dnf install ${missing[*]}"

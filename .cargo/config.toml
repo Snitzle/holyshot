@@ -3,3 +3,9 @@
 [env]
 PKG_CONFIG = "/usr/bin/pkg-config"
 PKG_CONFIG_PATH = { value = "build/pkgconfig", relative = true }
+
+# install.sh always compiles on the machine that runs the binary, so use its
+# full instruction set (AVX2 etc.): the image loops vectorise much better
+# (measured: preview downscale -48% instructions, editor view -26%).
+[build]
+rustflags = ["-C", "target-cpu=native"]

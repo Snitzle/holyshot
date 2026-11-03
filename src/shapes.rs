@@ -543,9 +543,12 @@ impl Shape {
 
 /// Draw a document: base image, then highlights (which blend with it),
 /// pixelation, then everything else in creation order.
-pub fn render(sn: &gtk::Snapshot, ctx: &Ctx, shapes: &[Shape], active: Option<&Shape>, filter: gsk::ScalingFilter) {
-    let full = rect(0.0, 0.0, ctx.base.w as f32, ctx.base.h as f32);
-    sn.append_scaled_texture(ctx.base_tex, filter, &full);
+/// `ctx.base_tex` may be a pre-scaled copy (the editor view); it is always
+/// drawn covering the full image rect.
+pub fn render(sn: &gtk::Snapshot, ctx: &Ctx, shapes: &[Shape], active: Option<&Shape>, draw_base: bool) {
+    if draw_base {
+        sn.append_texture(ctx.base_tex, &rect(0.0, 0.0, ctx.base.w as f32, ctx.base.h as f32));
+    }
     let all = || shapes.iter().chain(active);
     all().filter(|s| s.is_highlight()).for_each(|s| s.draw(sn, ctx));
     all().filter(|s| s.is_pixelate()).for_each(|s| s.draw(sn, ctx));
