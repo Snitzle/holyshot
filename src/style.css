@@ -1,0 +1,21 @@
+window.hs-layer { background: none; }
+
+.hs-tool { padding: 3px 6px; min-width: 50px; }
+.hs-toollabel { font-size: 8pt; }
+
+.hs-swatch {
+  min-width: 20px; min-height: 20px; padding: 0; margin: 0 1px;
+  border-radius: 999px; background-image: none;
+  border: 1px solid alpha(gray, 0.6); box-shadow: none;
+}
+.hs-swatch:checked { box-shadow: 0 0 0 2px #3daee9; border-color: white; }
+.hs-c0 { background-color: #ff3b30; }
+.hs-c1 { background-color: #ff9500; }
+.hs-c2 { background-color: #ffd60a; }
+.hs-c3 { background-color: #34c759; }
+.hs-c4 { background-color: #0a84ff; }
+.hs-c5 { background-color: #bf5af2; }
+.hs-c6 { background-color: #1c1c1e; }
+.hs-c7 { background-color: #ffffff; }
+
+.hs-bar separator { margin: 6px 6px; }

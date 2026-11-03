@@ -1,0 +1,5 @@
+# gtk4-layer-shell-devel isn't required: install.sh writes a pkg-config shim
+# into build/ that links against the runtime library instead.
+[env]
+PKG_CONFIG = "/usr/bin/pkg-config"
+PKG_CONFIG_PATH = { value = "build/pkgconfig", relative = true }

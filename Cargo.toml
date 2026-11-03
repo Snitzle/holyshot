@@ -1,0 +1,17 @@
+[package]
+name = "holyshot"
+version = "0.2.0"
+edition = "2024"
+description = "Mac-style screenshot + annotation tool for KDE Plasma (Wayland)"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+gtk4-layer-shell = "0.8"
+png = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
