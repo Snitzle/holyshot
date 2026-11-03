@@ -1,6 +1,6 @@
 //! The preview that slides into the bottom-right corner after a capture.
-//! Click: annotate. Drag: drop the file into another app. Hover: keep it.
-//! Right-click: more options.
+//! Click: annotate (a recording: play it). Drag: drop the file into another
+//! app. Hover: keep it. Right-click: more options.
 
 use gtk::{gdk, gio, glib, graphene, gsk, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -42,6 +42,8 @@ pub struct Thumb {
     size: (usize, usize),
     scale: f64,
     path: PathBuf,
+    /// A screen recording of this many seconds, rather than a screenshot.
+    video: Option<u64>,
     /// The preview at exactly its on-screen pixel size (see `show`).
     small: gdk::Texture,
     /// Shadow + image + border, rendered once (lazily, at device scale) so
@@ -63,7 +65,14 @@ impl Thumb {
 
     /// `preview` must be `preview_size` for the monitor (the capture thread
     /// computes it in parallel with GTK start-up for whole-screen shots).
-    pub fn show(hs: &Rc<Hs>, preview: Img, size: (usize, usize), path: PathBuf, monitor: Option<gdk::Monitor>) -> Rc<Thumb> {
+    pub fn show(
+        hs: &Rc<Hs>,
+        preview: Img,
+        size: (usize, usize),
+        path: PathBuf,
+        monitor: Option<gdk::Monitor>,
+        video: Option<u64>,
+    ) -> Rc<Thumb> {
         // Pre-scaled to the exact device-pixel size: the CPU renderer would
         // otherwise resample the full capture every frame (~60 ms CPU each).
         let dpr = monitor.as_ref().map(|m| m.scale()).unwrap_or(preview.scale).max(1.0) as f32;
@@ -75,7 +84,7 @@ impl Thumb {
         win.set_application(Some(&hs.app));
         win.init_layer_shell();
         win.set_layer(Layer::Overlay);
-        win.set_namespace(Some("holyshot-preview"));
+        win.set_namespace(Some(util::LAYER_NAMESPACE));
         if let Some(m) = &monitor {
             win.set_monitor(Some(m));
         }
@@ -102,6 +111,7 @@ impl Thumb {
             size,
             scale,
             path,
+            video,
             small,
             card: RefCell::new(None),
             tw,
@@ -187,7 +197,7 @@ impl Thumb {
                 if t.close_rect().contains_point(&p) {
                     t.dismiss();
                 } else if t.thumb_rect().contains_point(&p) {
-                    t.open_editor();
+                    t.activate();
                 }
             }
         });
@@ -203,6 +213,9 @@ impl Thumb {
             let file = gio::File::for_path(&t.path);
             let files = gdk::FileList::from_array(&[file]);
             let files = gdk::ContentProvider::for_value(&files.to_value());
+            if t.video.is_some() {
+                return Some(files);
+            }
             // also offer the image itself, for apps that take pasted images
             Some(match std::fs::read(&t.path) {
                 Ok(png) => gdk::ContentProvider::new_union(&[
@@ -248,7 +261,7 @@ impl Thumb {
         self.area.add_controller(right);
 
         let actions = gio::SimpleActionGroup::new();
-        for name in ["annotate", "copy", "folder", "delete", "close"] {
+        for name in ["annotate", "open", "copy", "folder", "delete", "close"] {
             let a = gio::SimpleAction::new(name, None);
             let w = Rc::downgrade(self);
             a.connect_activate(move |a, _| {
@@ -266,8 +279,12 @@ impl Thumb {
         let existing = self.st.borrow().menu.clone();
         let pop = existing.unwrap_or_else(|| {
             let m = gio::Menu::new();
-            m.append(Some("Annotate…"), Some("thumb.annotate"));
-            m.append(Some("Copy"), Some("thumb.copy"));
+            if self.video.is_some() {
+                m.append(Some("Open"), Some("thumb.open"));
+            } else {
+                m.append(Some("Annotate…"), Some("thumb.annotate"));
+                m.append(Some("Copy"), Some("thumb.copy"));
+            }
             m.append(Some("Show in Folder"), Some("thumb.folder"));
             let m2 = gio::Menu::new();
             m2.append(Some("Move to Trash"), Some("thumb.delete"));
@@ -296,6 +313,7 @@ impl Thumb {
         let path = self.path.clone();
         match name {
             "annotate" => self.open_editor(),
+            "open" => self.activate(),
             "close" => self.dismiss(),
             _ => {
                 let what = name.to_string();
@@ -324,6 +342,18 @@ impl Thumb {
 
     pub fn img_size(&self) -> (usize, usize) {
         self.size
+    }
+
+    /// Click: annotate a screenshot, play a recording.
+    fn activate(self: &Rc<Self>) {
+        if self.video.is_none() {
+            return self.open_editor();
+        }
+        let uri = gio::File::for_path(&self.path).uri();
+        if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, Some(&util::launch_context())) {
+            util::notify("Couldn't open the recording", &e.to_string());
+        }
+        self.dismiss();
     }
 
     pub fn open_editor(self: &Rc<Self>) {
@@ -468,6 +498,12 @@ impl Thumb {
         sn.pop();
         sn.append_border(&util::rounded(r.inset_r(1.0, 1.0), RADIUS - 1.0), &[2.0; 4], &[rgba(1.0, 1.0, 1.0, 0.85); 4]);
         sn.append_border(&rr, &[1.0; 4], &[rgba(0.0, 0.0, 0.0, 0.25); 4]);
+        if let Some(secs) = self.video {
+            // play badge with the length, bottom-left
+            let l = util::layout(&self.area, &format!("▶  {}:{:02}", secs / 60, secs % 60), 9.5, true);
+            let (_, lh) = l.pixel_size();
+            util::pill(&sn, &l, r.x() + 8.0, r.y() + r.height() - lh as f32 - 16.0, 8.0, 4.0, 6.0);
+        }
         let node = sn.to_node()?;
         let renderer = gsk::CairoRenderer::new();
         renderer.realize_for_display(&WidgetExt::display(&self.area)).ok()?;

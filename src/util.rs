@@ -10,6 +10,10 @@ pub fn trace_init() {
     START.get_or_init(|| (Instant::now(), std::env::var_os("HOLYSHOT_TRACE").is_some()));
 }
 
+pub fn tracing() -> bool {
+    START.get().is_some_and(|s| s.1)
+}
+
 pub fn trace(what: &str) {
     if let Some((t, true)) = START.get() {
         use std::io::Write;
@@ -269,6 +273,13 @@ pub fn launch_context() -> gio::AppLaunchContext {
     ctx
 }
 
+/// A child process with the environment we started with.
+pub fn command(name: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(name);
+    restore_env(&mut cmd);
+    cmd
+}
+
 fn restore_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for (k, v) in ORIG_ENV.get().into_iter().flatten() {
         match v {
@@ -365,6 +376,9 @@ pub struct Config {
     pub save_dir: PathBuf,
     pub copy_to_clipboard: bool,
     pub thumbnail_seconds: f64,
+    pub record_dir: PathBuf,
+    pub record_encoder: String,
+    pub remember_area: bool,
 }
 
 const DEFAULT_CONFIG: &str = "\
@@ -375,6 +389,12 @@ save_dir=~/Pictures/Screenshots
 copy_to_clipboard=true
 # How long the bottom-right preview stays up (hovering pauses it)
 thumbnail_seconds=6
+# Where screen recordings are saved
+record_dir=~/Videos/Screencasts
+# auto, or one of: nvh264enc vah264lpenc vah264enc x264enc openh264enc
+record_encoder=auto
+# Start the area picker with the last box you used (Delete clears it)
+remember_area=true
 ";
 
 pub fn config() -> &'static Config {
@@ -389,10 +409,14 @@ pub fn config() -> &'static Config {
         }
         let g = "holyshot";
         let dir = kf.string(g, "save_dir").map(|s| s.to_string()).unwrap_or_else(|_| "~/Pictures/Screenshots".into());
+        let s = |k: &str, d: &str| kf.string(g, k).map(|s| s.to_string()).unwrap_or_else(|_| d.into());
         Config {
             save_dir: expand(&dir),
             copy_to_clipboard: kf.boolean(g, "copy_to_clipboard").unwrap_or(true),
             thumbnail_seconds: kf.double(g, "thumbnail_seconds").unwrap_or(6.0).max(1.0),
+            record_dir: expand(&s("record_dir", "~/Videos/Screencasts")),
+            record_encoder: s("record_encoder", "auto"),
+            remember_area: kf.boolean(g, "remember_area").unwrap_or(true),
         }
     })
 }
@@ -405,17 +429,47 @@ fn expand(p: &str) -> PathBuf {
     }
 }
 
-pub fn unique_path() -> PathBuf {
-    let dir = &config().save_dir;
+fn last_area_file() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| glib::home_dir().join(".local/state"))
+        .join("holyshot/last-area")
+}
+
+/// The last box picked, in global logical coordinates.
+pub fn last_area() -> Option<(i32, i32, i32, i32)> {
+    if !config().remember_area {
+        return None;
+    }
+    let s = std::fs::read_to_string(last_area_file()).ok()?;
+    let v: Vec<i32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    match v[..] {
+        [x, y, w, h] if w > 0 && h > 0 => Some((x, y, w, h)),
+        _ => None,
+    }
+}
+
+pub fn save_last_area((x, y, w, h): (i32, i32, i32, i32)) {
+    if !config().remember_area {
+        return;
+    }
+    let f = last_area_file();
+    let _ = std::fs::create_dir_all(f.parent().unwrap());
+    let _ = std::fs::write(f, format!("{x} {y} {w} {h}\n"));
+}
+
+/// e.g. `~/Pictures/Screenshots/Screenshot 2026-11-03 at 12.34.56.png`
+pub fn unique_path(dir: &Path, prefix: &str, ext: &str) -> PathBuf {
     let _ = std::fs::create_dir_all(dir);
     let stamp = glib::DateTime::now_local()
-        .and_then(|d| d.format("Screenshot %Y-%m-%d at %H.%M.%S"))
+        .and_then(|d| d.format(&format!("{prefix} %Y-%m-%d at %H.%M.%S")))
         .map(|s| s.to_string())
-        .unwrap_or_else(|_| "Screenshot".into());
-    let mut p = dir.join(format!("{stamp}.png"));
+        .unwrap_or_else(|_| prefix.into());
+    let mut p = dir.join(format!("{stamp}.{ext}"));
     let mut n = 2;
     while p.exists() {
-        p = dir.join(format!("{stamp} ({n}).png"));
+        p = dir.join(format!("{stamp} ({n}).{ext}"));
         n += 1;
     }
     p
@@ -516,6 +570,15 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32) -> graphene::Rect {
 pub fn rounded(r: graphene::Rect, radius: f32) -> gsk::RoundedRect {
     gsk::RoundedRect::from_rect(r, radius)
 }
+
+/// Layer-shell namespace for all our surfaces. KWin turns a namespace it
+/// doesn't recognise into a *normal* window, and its default open/close
+/// animation (Scale) then grows every one of them from 80 % at its centre,
+/// fading it in: the picker visibly zooms out from the middle of the screen,
+/// fights the preview's own slide, and the picker's 200 ms close animation
+/// could land in a recording's first frames. "dock" (what panels use) is
+/// skipped by Scale, Fade and Fading Popups, and keeps keyboard focus.
+pub const LAYER_NAMESPACE: &str = "dock";
 
 pub fn layout(widget: &impl IsA<gtk::Widget>, text: &str, pt: f64, bold: bool) -> pango::Layout {
     let l = widget.create_pango_layout(Some(text));

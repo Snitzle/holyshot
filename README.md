@@ -10,13 +10,17 @@ Mac-style screenshots for KDE Plasma (Wayland), in Rust + GTK4.
 
 | Shortcut | What it does |
 |---|---|
-| **Print** / **Meta+Shift+4** | Dim the screen and drag out a box. Move/resize it at leisure, then **Enter**, double-click or **Capture**. Esc / right-click cancels. |
+| **Print** / **Meta+Shift+4** | Dim the screen and drag out a box. Move/resize it at leisure, then **Enter**, double-click or **Capture**; or **● Record** (or **R**) to record it instead. Esc / right-click cancels. **Space** switches to window mode. It opens with the last box you used (Delete clears it, so Enter takes the whole screen). **⏱** (or **T**) sets a 3 / 5 / 10 s self-timer: the countdown lets clicks through, so you can open the menu you want to capture; press the shortcut again to cancel it. |
+| **Meta+Print** | Window mode: the window under the mouse lights up blue; click it (or press **R** to record it). You get the whole window (frame and shadow) even if something covers it. Space goes back to drawing a box. |
 | **Shift+Print** / **Meta+Shift+3** | Capture the whole screen the mouse is on. |
+| **Meta+Shift+5** / **Meta+Shift+R** | Record: pick an area, a window (Space) or the whole screen (Enter), then **● Record**. A small pill shows the time; click it, or press the shortcut again, to stop. |
 
 A preview slides into the bottom-right corner: **click** it to annotate,
 **drag** it into another app to drop the file, hover to keep it, right-click
 for Copy / Show in Folder / Move to Trash. Every shot is saved to
-`~/Pictures/Screenshots` and copied to the clipboard.
+`~/Pictures/Screenshots` and copied to the clipboard. Recordings (MP4, H.264,
+with the cursor, no sound) go to `~/Videos/Screencasts`; clicking their
+preview plays them.
 
 The editor has Arrow, Box, Circle, Draw, Highlight, Text, Steps (1, 2, 3…) and
 Pixelate, 8 colours and 3 sizes. Keys: `V A R E P H T N B` pick tools, `1`–`8`
@@ -31,7 +35,8 @@ Ctrl+Shift+Z, Ctrl+C copies, Ctrl+S saves, **Save** saves and closes.
 ```
 
 Needs `gtk4-devel`, `gtk4-layer-shell` (runtime lib only), `wl-clipboard` and
-Rust. Settings: `~/.config/holyshot/config.ini`.
+Rust; recording also uses GStreamer with `pipewire-gstreamer` (both normally
+installed on Fedora KDE). Settings: `~/.config/holyshot/config.ini`.
 
 ## How it stays fast and light
 
@@ -56,7 +61,7 @@ doesn't move with machine load. 3440×1440 @ 115 %:
 | While the preview shows | 61 MB (27 MB private) | **42 MB (8 MB private)** |
 | Area: instructions | 774 M | **432 M** (−44 %) |
 | Editor self-test: instructions | 4 501 M | **2 227 M** (−51 %) |
-| Binary | 891 KB | **817 KB**, 8 fewer crates |
+| Binary | 891 KB | **910 KB** (with recording), 8 fewer crates |
 | Between screenshots | 0 | 0 |
 
 The floor is GTK itself: linking its ~115 libraries costs ~96 M instructions
@@ -91,12 +96,37 @@ before `main`, and `gtk_init` another ~130 M.
   theme, and the editor (the only window with icons) switches to the real one.
 - **fontconfig warmed on a side thread** while GTK starts (−19 ms on the first
   text the overlay draws).
+- **Window mode without guessing**: KWin has no D-Bus call that lists windows,
+  so a two-line KWin script, loaded and run over D-Bus, calls back with the
+  stacking order (3 ms, while the screen is captured anyway).
+
+### Recording
+
+KWin streams the area or window into PipeWire through its private
+`zkde_screencast_unstable_v1` Wayland protocol (the one Spectacle uses,
+granted to this binary by its desktop file). HolyShot speaks the six
+messages it needs directly over the Wayland socket, so it needs no Wayland
+crates, and a `gst-launch-1.0` child does the encoding:
+
+- **On the GPU when there is one.** NVENC takes KWin's BGRx frames as they
+  are, so no CPU colour conversion; VA-API, then x264, are the fallbacks.
+  The first working encoder is found while you're still picking the area
+  (once per boot; then it's cached). A full 3440×1440 screen records at
+  **~22 % of one core** and ~3 Mbit/s; HolyShot itself sits at 63 MB.
+- **Only changed frames.** KWin sends a frame when something on screen
+  changes (up to 60 fps), so a still screen costs next to nothing.
+- **Crash-proof file.** It records to Matroska, which stays playable however
+  the recording ends: KWin dropping the stream (the window closed), the
+  encoder dying, or HolyShot itself dying (the encoder gets SIGINT and
+  finishes the file). A stream copy (no re-encoding) then makes the MP4.
 
 Tried and rejected (measured worse): BGRx textures (force a per-pixel
 conversion), a zero-copy Cairo surface for the overlay (GTK caches a copy
 anyway), `opt-level = "s"` (−11 % size, 2× slower pixel loops).
 
 Set `HOLYSHOT_TRACE=1` to print timings with per-thread instruction counts.
-Dev-only commands: `__dump FILE` (capture without UI), `__bench-png FILE…`,
-`__bench-scale FILE`, `__selftest IN OUT` and `__selftest-area` (drive the
-editor / picker with synthetic input).
+Dev-only commands: `__dump FILE` (capture without UI), `__windows [FILE]`
+(list windows, capture the top one), `__bench-png FILE…`, `__bench-scale FILE`,
+`__selftest IN OUT`, `__selftest-area [record] [PNG]`, `__selftest-timer PNG`, `__selftest-window OUT` and
+`__selftest-record [region|window|screen] [SECS]` (drive the editor / picker /
+recorder with synthetic input).

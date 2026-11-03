@@ -3,11 +3,13 @@
 set -uo pipefail
 ID=dev.holyshot
 KGA=(gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel -m)
-for a in "'_launch','HolyShot','Capture Area'" "'screen','HolyShot','Capture Whole Screen'"; do
+for a in "'_launch','HolyShot','Capture Area'" "'screen','HolyShot','Capture Whole Screen'" \
+         "'window','HolyShot','Capture Window'" "'record','HolyShot','Record Screen'"; do
     "${KGA[@]}" org.kde.KGlobalAccel.setShortcut "['$ID.desktop',$a]" "@ai []" 4 >/dev/null
 done
-"${KGA[@]}" org.kde.KGlobalAccel.unregister "$ID.desktop" _launch >/dev/null
-"${KGA[@]}" org.kde.KGlobalAccel.unregister "$ID.desktop" screen >/dev/null
+for a in _launch screen window record; do
+    "${KGA[@]}" org.kde.KGlobalAccel.unregister "$ID.desktop" $a >/dev/null
+done
 "${KGA[@]}" org.kde.KGlobalAccel.setShortcut \
     "['org.kde.spectacle.desktop','_launch','Spectacle','Launch Spectacle']" "[$((0x01000009)), $((0x12000053))]" 4 >/dev/null
 "${KGA[@]}" org.kde.KGlobalAccel.setShortcut \

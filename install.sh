@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds and installs HolyShot for the current user on KDE Plasma (Wayland).
 #   binary     -> ~/.local/bin/holyshot
-#   shortcuts  -> Print / Meta+Shift+4 = area,  Shift+Print / Meta+Shift+3 = screen under mouse
+#   shortcuts  -> Print / Meta+Shift+4 = area,  Shift+Print / Meta+Shift+3 = screen under mouse,
+#                 Meta+Print = window,  Meta+Shift+5 / Meta+Shift+R = record (again to stop)
 #                 (Print and Shift+Print are taken off Spectacle)
 # Nothing runs in the background: each shortcut press starts the binary and it
 # exits once the preview / editor is gone.
@@ -19,6 +20,8 @@ missing=()
 [ -e /usr/lib64/libgtk4-layer-shell.so.0 ] || missing+=(gtk4-layer-shell)
 [ -e /usr/lib64/libdeflate.so.0 ] || missing+=(libdeflate)
 command -v wl-copy >/dev/null || missing+=(wl-clipboard)
+command -v gst-launch-1.0 >/dev/null || missing+=(gstreamer1)
+gst-inspect-1.0 --exists pipewiresrc 2>/dev/null || missing+=(pipewire-gstreamer)
 if [ ${#missing[@]} -gt 0 ]; then
     echo "Missing packages: sudo dnf install ${missing[*]}"
     exit 1
@@ -66,8 +69,10 @@ mv -f "$BIN.new" "$BIN"   # atomic, safe even if a copy is running
 # desktop file carrying X-KDE-DBUS-Restricted-Interfaces -- and it only looks
 # at the *first* matching desktop file, in whatever order KDE's service cache
 # happens to list them. So every desktop file that launches this binary must
-# carry the key.
+# carry the key. Screen recording is granted the same way, through
+# X-KDE-Wayland-Interfaces.
 PERM="X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2"
+PERM_REC="X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1"
 rm -f "$APPS/$ID.capture.desktop"   # older installs used a separate file
 
 cat > "$APPS/$ID.desktop" <<EOF
@@ -83,13 +88,24 @@ Keywords=screenshot;capture;annotate;
 StartupNotify=false
 X-KDE-StartupNotify=false
 $PERM
+$PERM_REC
 X-KDE-Shortcuts=Print,Meta+Shift+4
-Actions=screen;
+Actions=screen;window;record;
 
 [Desktop Action screen]
 Name=Capture Whole Screen
 Exec=$BIN screen
 X-KDE-Shortcuts=Shift+Print,Meta+Shift+3
+
+[Desktop Action window]
+Name=Capture Window
+Exec=$BIN window
+X-KDE-Shortcuts=Meta+Print
+
+[Desktop Action record]
+Name=Record Screen
+Exec=$BIN record
+X-KDE-Shortcuts=Meta+Shift+5,Meta+Shift+R
 EOF
 
 cat > "$APPS/$ID.editor.desktop" <<EOF
@@ -103,6 +119,7 @@ MimeType=image/png;image/jpeg;image/webp;
 NoDisplay=true
 StartupNotify=false
 $PERM
+$PERM_REC
 EOF
 
 # Fail loudly if some other desktop file launches this binary without the key.
@@ -126,10 +143,14 @@ reg() { # action, friendly name, keys
 }
 reg _launch "Capture Area" "[$PRINT, $((META | SHIFT | 0x34))]"
 reg screen "Capture Whole Screen" "[$((SHIFT | PRINT)), $((META | SHIFT | 0x33))]"
+reg window "Capture Window" "[$((META | PRINT))]"
+reg record "Record Screen" "[$((META | SHIFT | 0x35)), $((META | SHIFT | 0x52))]"
 
 echo
 echo "Done."
 echo "  Print  or  Meta+Shift+4          pick an area (drag, adjust, then Enter / Capture)"
 echo "  Shift+Print  or  Meta+Shift+3    capture the screen the mouse is on"
-echo "Screenshots go to ~/Pictures/Screenshots and the clipboard."
+echo "  Meta+Print                       pick a window (or press Space while picking an area)"
+echo "  Meta+Shift+5  or  Meta+Shift+R   record an area / window / screen; press again to stop"
+echo "Screenshots go to ~/Pictures/Screenshots and the clipboard; recordings to ~/Videos/Screencasts."
 echo "Settings: ~/.config/holyshot/config.ini   Shortcuts: System Settings > Shortcuts > HolyShot"
